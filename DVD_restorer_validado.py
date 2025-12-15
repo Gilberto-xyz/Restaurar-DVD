@@ -1,5 +1,5 @@
 # Uso:
-#   python volcar_dvd_grid_safe_noprogress.py F DVD_dump.iso --cols 60 --rows 18 --zero-tail-mb 512 --no-progress-min 5 --no-progress-armed-mb 300
+#   python DVD_restorer_validado.py F DVD_dump.iso --cols 60 --rows 18 --zero-tail-mb 512 --no-progress-min 5 --no-progress-armed-mb 300
 #
 # Ejecuta PowerShell/CMD como **Administrador**. Cierra IsoBuster/VLC.
 
@@ -145,8 +145,8 @@ def estimate_total(letter, dvd_file):
 # ----------------- UI -----------------
 def draw_grid(cols, rows, filled_cells, total_cells):
     filled_cells = max(0, min(total_cells, filled_cells))
-    full = "█"
-    empty = "░"
+    full = "#"
+    empty = "."
     out_lines = []
     for r in range(rows):
         line = []
@@ -174,13 +174,13 @@ def update_ui_matrix(cols, rows, bytes_done, total, zero_sectors, rescued, t0, n
 def update_ui_bar(bytes_done, zero_sectors, rescued, t0, width=50, note=""):
     filled = min(width, int(width))  # solo estética; no % real
     speed = bytes_done / max(1e-6, (time.time()-t0))
-    bar = "█"*min(width, int((bytes_done/ (1024*1024)) % (width+1))) + "░"*max(0, width - min(width, int((bytes_done/ (1024*1024)) % (width+1))))
+    bar = "#"*min(width, int((bytes_done/ (1024*1024)) % (width+1))) + "."*max(0, width - min(width, int((bytes_done/ (1024*1024)) % (width+1))))
     print(f"\r[{bar:<{width}}]  {human(bytes_done)} | {human(speed)}/s | 0x00:{zero_sectors} | rescates:{rescued}{note} ", end="", flush=True)
 
 # ----------------- volcado adaptativo + colas + no-progreso -----------------
 def dump(letter, out_path, cols, rows, zero_tail_mb, no_progress_min, no_progress_armed_mb):
     if not is_admin():
-        print("ERROR: este script debe ejecutarse como **Administrador** (lectura raw de \\.\DEVICE).")
+        print("ERROR: este script debe ejecutarse como **Administrador** (lectura raw de \\\\.\\DEVICE).")
         sys.exit(2)
 
     device = f"\\\\.\\{letter}:"
@@ -188,7 +188,7 @@ def dump(letter, out_path, cols, rows, zero_tail_mb, no_progress_min, no_progres
         total, src = estimate_total(letter, dvd)
         has_percent = total is not None
         print(f"Tamaño estimado: {human(total)} ({src})" if has_percent else
-              "Sin tamaño total creíble → usaré barra + detección de cola de ceros + corte por no-progreso.")
+              "Sin tamaño total creíble: usaré barra + detección de cola de ceros + corte por no-progreso.")
 
         print_ui_header()
         with open(out_path, "wb", buffering=0) as iso:
@@ -202,10 +202,9 @@ def dump(letter, out_path, cols, rows, zero_tail_mb, no_progress_min, no_progres
             zero_tail_bytes = 0
             zero_tail_limit = int(zero_tail_mb * 1024 * 1024)
 
-            # No-progreso (según bytes escritos)
+            # No-progreso (según lecturas válidas)
             no_progress_secs = int(no_progress_min * 60)
-            last_advance_bytes = 0
-            last_advance_ts = time.time()
+            last_good_read_ts = time.time()
             no_progress_triggered = False
 
             while True:
@@ -216,7 +215,8 @@ def dump(letter, out_path, cols, rows, zero_tail_mb, no_progress_min, no_progres
                     dvd.seek(-len(probe), os.SEEK_CUR)
 
                 advanced = False
-                last_size = BLOCK_SIZES_SECTORS[0] * SECTOR_SIZE
+                eof = False
+                had_block_failure = False
 
                 for blk_secs in BLOCK_SIZES_SECTORS:
                     blk = blk_secs * SECTOR_SIZE
@@ -225,9 +225,6 @@ def dump(letter, out_path, cols, rows, zero_tail_mb, no_progress_min, no_progres
                     while tries < RETRIES:
                         try:
                             data = dvd.read(blk)
-                            if not data:
-                                ok = True
-                                break
                             ok = True
                             break
                         except PermissionError:
@@ -237,13 +234,15 @@ def dump(letter, out_path, cols, rows, zero_tail_mb, no_progress_min, no_progres
                             tries += 1
                     if ok:
                         if not data:  # EOF
+                            eof = True
                             break
                         iso.write(data)
                         bytes_done += len(data)
                         iso.flush()  # asegurar que el tamaño en disco avance
                         os.fsync(iso.fileno())
                         advanced = True
-                        last_size = blk
+                        if had_block_failure:
+                            rescued_errors += 1
 
                         if not has_percent:
                             if all(b == 0 for b in data):
@@ -252,32 +251,34 @@ def dump(letter, out_path, cols, rows, zero_tail_mb, no_progress_min, no_progres
                                 zero_tail_bytes = 0
                         break
                     else:
+                        had_block_failure = True
                         continue
+
+                if eof:
+                    break
 
                 if not advanced:
                     iso.write(b"\x00" * SECTOR_SIZE)
                     bytes_done += SECTOR_SIZE
                     iso.flush(); os.fsync(iso.fileno())
                     zero_filled_sectors += 1
-                    last_size = SECTOR_SIZE
                     if not has_percent:
                         zero_tail_bytes += SECTOR_SIZE
 
                 # --- control de no-progreso ---
-                if bytes_done > last_advance_bytes:
-                    last_advance_bytes = bytes_done
-                    last_advance_ts = time.time()
+                if advanced:
+                    last_good_read_ts = time.time()
                 else:
-                    # Si ya leímos al menos 'armed' MB y no avanzamos en 'no_progress_secs', cortar
-                    if bytes_done >= no_progress_armed_mb * 1024 * 1024 and (time.time() - last_advance_ts) >= no_progress_secs:
+                    # Si ya leímos al menos 'armed' MB y no logramos lecturas válidas en 'no_progress_secs', cortar
+                    if bytes_done >= no_progress_armed_mb * 1024 * 1024 and (time.time() - last_good_read_ts) >= no_progress_secs:
                         no_progress_triggered = True
-                        print("\nCorte por **no progreso**: el archivo no aumentó de tamaño en el intervalo definido.")
+                        print("\nCorte por **no progreso**: no se pudo leer ningún bloque válido en el intervalo definido.")
                         break
 
                 # --- cola de ceros (solo sin total fiable) ---
                 if not has_percent:
                     if bytes_done > 500*1024*1024 and zero_tail_bytes >= zero_tail_limit:
-                        print("\nDetectada cola larga de ceros sin tamaño total fiable → asumo final del disco.")
+                        print("\nDetectada cola larga de ceros sin tamaño total fiable: asumo final del disco.")
                         break
 
                 # UI
@@ -300,7 +301,7 @@ def dump(letter, out_path, cols, rows, zero_tail_mb, no_progress_min, no_progres
             dur = time.time()-t0
             print(f"\nListo: {human(bytes_done)} en {dur:.1f}s (~{human(bytes_done/max(1,dur))}/s)")
             if no_progress_triggered:
-                print("Motivo de fin: no hubo incremento de tamaño durante el período configurado; es probable que ya no existan más datos útiles.")
+                print("Motivo de fin: no hubo lecturas válidas durante el período configurado; es probable que esa zona sea completamente ilegible.")
             elif zero_filled_sectors:
                 print(f"Aviso: {zero_filled_sectors} sector(es) ilegibles se rellenaron con ceros.")
             if rescued_errors:
@@ -320,7 +321,7 @@ def main():
                     help="MB mínimos leídos antes de habilitar el corte por no-progreso (evita falsos positivos). Default 500.")
     args = ap.parse_args()
     letter = args.letter.strip(":").upper()
-    dump(letter, args.output, args.cols, args.rows, args.zero_tail_mb, args["no_progress_min"] if isinstance(args, dict) else args.no_progress_min, args.no_progress_armed_mb)
+    dump(letter, args.output, args.cols, args.rows, args.zero_tail_mb, args.no_progress_min, args.no_progress_armed_mb)
 
 if __name__ == "__main__":
     try:
